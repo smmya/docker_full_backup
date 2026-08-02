@@ -17,6 +17,15 @@ mdserver-web (MW 面板) 关键数据备份工具。
   * 业务站点数据：默认开启，站点根目录按面板 `site_path` 选项
     动态解析（默认 `<fatherDir>/wwwroot`），也可 `--wwwroot <绝对路径>` 直接指定；`--no-wwwroot` 关闭
 
+归档内部目录结构：
+  * mw-server/panel/       — 面板自身状态（data/、ssl/）
+  * mw-server/panel/server/— serverDir 级共享配置（web_conf、元数据）
+  * mw-server/cron/        — 面板计划任务脚本
+  * mw-server/plugins/     — 已安装插件配置与数据
+  * databases/             — 数据库命令导出结果
+  * file/root/ file/opt/ file/home/ file/etc/ — 系统目录
+  * wwwroot/               — 业务站点数据
+
 明确不备份：
   * 二进制包与中间文件（缓存、构建产物、node_modules、*.pyc、.git、版本 tar 包…）
   * 数据库的原始数据目录（已由导出命令覆盖）
@@ -688,7 +697,7 @@ class PanelLayout:
 
 #: serverDir 下不是插件的共享目录（面板自身、日志、回收站等）。
 #: 注意 `cron` 仍留在这里——它不是插件，不应出现在 detected_plugins；
-#: 其内容由专用单元 `panel-cron`（归档内 `server/cron/`）单独采集。
+#: 其内容由专用单元 `panel-cron`（归档内 `mw-server/cron/`）单独采集。
 SERVER_SHARED_DIR_NAMES: FrozenSet[str] = frozenset({
     "web_conf", "wwwlogs", "wwwroot", "recycle_bin", "backup", "cron",
     "panel", "tmp", "mdserver-web",
@@ -766,24 +775,24 @@ class DbSpec:
 
 
 DB_PLUGINS: Dict[str, DbSpec] = {
-    "mysql": DbSpec("mysql", "dumps/mysql-all.sql"),
-    "mysql-community": DbSpec("mysql", "dumps/mysql-all.sql"),
-    "mysql-apt": DbSpec("mysql", "dumps/mysql-all.sql"),
-    "mysql-yum": DbSpec("mysql", "dumps/mysql-all.sql"),
-    "mariadb": DbSpec("mariadb", "dumps/mysql-all.sql"),
+    "mysql": DbSpec("mysql", "databases/mysql-all.sql"),
+    "mysql-community": DbSpec("mysql", "databases/mysql-all.sql"),
+    "mysql-apt": DbSpec("mysql", "databases/mysql-all.sql"),
+    "mysql-yum": DbSpec("mysql", "databases/mysql-all.sql"),
+    "mariadb": DbSpec("mariadb", "databases/mysql-all.sql"),
     "postgresql": DbSpec(
         "postgresql",
-        "dumps/postgresql-all.sql",
+        "databases/postgresql-all.sql",
         config_files_in_data=("postgresql.conf", "pg_hba.conf", "pg_ident.conf"),
     ),
     "pgsql": DbSpec(
         "postgresql",
-        "dumps/postgresql-all.sql",
+        "databases/postgresql-all.sql",
         config_files_in_data=("postgresql.conf", "pg_hba.conf", "pg_ident.conf"),
     ),
-    "redis": DbSpec("redis", "dumps/redis.rdb"),
-    "valkey": DbSpec("redis", "dumps/valkey.rdb"),
-    "mongodb": DbSpec("mongodb", "dumps/mongodb.archive"),
+    "redis": DbSpec("redis", "databases/redis.rdb"),
+    "valkey": DbSpec("redis", "databases/valkey.rdb"),
+    "mongodb": DbSpec("mongodb", "databases/mongodb.archive"),
 }
 
 
@@ -1473,7 +1482,7 @@ def dump_mysql(plugin_dir: pathlib.Path, dest_dir: pathlib.Path, plugin: str, en
 
     if not all_attempts:
         result = DumpResult(
-            plugin=plugin, engine=engine, relative="dumps/mysql",
+            plugin=plugin, engine=engine, relative="databases/mysql",
             ok=False, message="未找到 mysqldump / mariadb-dump 可执行文件",
         )
         return [result]
@@ -1528,14 +1537,14 @@ def dump_mysql(plugin_dir: pathlib.Path, dest_dir: pathlib.Path, plugin: str, en
             if ok:
                 result = DumpResult(
                     plugin=plugin, engine=engine,
-                    relative="dumps/mysql-all.sql", ok=True,
+                    relative="databases/mysql-all.sql", ok=True,
                     command=shlex.join(cmd), bytes=out_path.stat().st_size,
                 )
                 return [result]
             attempt_errors.append(f"{shlex.join(cmd)} -> {message}")
         result = DumpResult(
             plugin=plugin, engine=engine,
-            relative="dumps/mysql-all.sql", ok=False,
+            relative="databases/mysql-all.sql", ok=False,
             message="; ".join(attempt_errors[-3:] or errors[-3:]),
         )
         return [result]
@@ -1555,7 +1564,7 @@ def dump_mysql(plugin_dir: pathlib.Path, dest_dir: pathlib.Path, plugin: str, en
     results: List[DumpResult] = []
     for db in dbs:
         out_path = dest_dir / f"mysql-{db}.sql"
-        relative = f"dumps/mysql-{db}.sql"
+        relative = f"databases/mysql-{db}.sql"
         result = DumpResult(plugin=plugin, engine=engine, relative=relative, ok=False)
         cmd = working_base + ["--databases", db] + common_flags
         ok, message = _run_dump_to_file(cmd, out_path)
@@ -1668,7 +1677,7 @@ def run_db_dumps(
     stage_root: pathlib.Path,
 ) -> List[DumpResult]:
     """
-    对所有 DB 类插件执行导出，结果写入 `<stage_root>/dumps/`。
+    对所有 DB 类插件执行导出，结果写入 `<stage_root>/databases/`。
 
     采用 best-effort 策略：单个导出失败只 warn 并记入 manifest，不中断整体备份。
     """
@@ -1684,7 +1693,7 @@ def run_db_dumps(
             continue
         info(f"导出数据库: {plan.name} -> {spec.dump_relative}")
         if spec.engine in ("mysql", "mariadb"):
-            dest_dir = stage_root / "dumps"
+            dest_dir = stage_root / "databases"
             batch = dump_mysql(plan.base_dir, dest_dir, plan.name, spec.engine)
             for result in batch:
                 if result.ok:
@@ -1929,7 +1938,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
             plan.units.append(CaptureUnit(
                 unit_id="panel-state",
                 category="panel",
-                archive_prefix="panel",
+                archive_prefix="mw-server/panel",
                 sources=panel_sources,
                 profile=PROFILE_CONFIG,
                 note="面板主库、运行参数与 SSL 证书",
@@ -1949,7 +1958,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
             plan.units.append(CaptureUnit(
                 unit_id="panel-server-shared",
                 category="server",
-                archive_prefix="panel/server",
+                archive_prefix="mw-server/panel/server",
                 sources=server_sources,
                 profile=PROFILE_CONFIG,
                 note="serverDir 级共享配置（nginx vhost / php 处理器 / 插件元数据库）",
@@ -1963,7 +1972,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
                 unit_id="panel-cron",
                 category="server",
                 kind="cron-scripts",
-                archive_prefix="server/cron",
+                archive_prefix="mw-server/cron",
                 source_path=str(cron_dir),
                 sources=[(cron_dir, "")],
                 # 脚本多为无扩展名/.sh 文本，用 config profile 避免被 strict 的
@@ -1997,7 +2006,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
                 plan.units.append(CaptureUnit(
                     unit_id=f"plugin:{name}:config",
                     category="plugin",
-                    archive_prefix=f"plugins/{safe_slug(name)}",
+                    archive_prefix=f"mw-server/plugins/{safe_slug(name)}",
                     sources=[
                         (path, "config/" + _relative_under(plugin_plan.base_dir, path))
                         for path in plugin_plan.config_paths
@@ -2010,7 +2019,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
                 plan.units.append(CaptureUnit(
                     unit_id=f"plugin:{name}:data",
                     category="plugin",
-                    archive_prefix=f"plugins/{safe_slug(name)}",
+                    archive_prefix=f"mw-server/plugins/{safe_slug(name)}",
                     sources=[
                         # data_paths 的相对路径本身就以 data/ 开头，无需再加前缀。
                         (path, _relative_under(plugin_plan.base_dir, path))
@@ -2056,7 +2065,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
         plan.units.append(CaptureUnit(
             unit_id=f"system:{name}",
             category="system",
-            archive_prefix=f"system/{name}",
+            archive_prefix=f"file/{name}",
             sources=[(path, "")],
             profile=PROFILE_STRICT,
             note=f"系统目录 {path}（已排除二进制与中间文件）",
@@ -2069,7 +2078,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
             plan.units.append(CaptureUnit(
                 unit_id="system:home",
                 category="system",
-                archive_prefix="system/home",
+                archive_prefix="file/home",
                 sources=[(home, "")],
                 profile=PROFILE_STRICT,
                 note="系统目录 /home（默认备份；--no-home 可关闭）",
@@ -2088,7 +2097,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
         plan.units.append(CaptureUnit(
             unit_id="system:etc",
             category="system",
-            archive_prefix="system/etc",
+            archive_prefix="file/etc",
             sources=etc_sources,
             profile=PROFILE_CONFIG,
             note="/etc 白名单：网络、用户/账户、用户自建服务配置",
@@ -2300,9 +2309,9 @@ def print_plan(plan: BackupPlan) -> None:
     if not plan.etc_allowlist:
         print("  (无)")
     print()
-    structure = ["manifest.json", "checksums.sha256", "plugins/", "dumps/", "system/", "panel/"]
+    structure = ["manifest.json", "checksums.sha256", "mw-server/plugins/", "databases/", "file/", "mw-server/panel/"]
     if plan.cron_dir is not None:
-        structure.append("server/cron/")
+        structure.append("mw-server/cron/")
     if plan.site_root is not None:
         structure.append("wwwroot/")
     print("归档内部结构: " + " / ".join(structure))
