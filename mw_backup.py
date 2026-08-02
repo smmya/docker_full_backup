@@ -554,6 +554,15 @@ PANEL_ROOT_CANDIDATES: Tuple[str, ...] = (
     "/usr/local/lib/mdserver-web",
 )
 
+#: 上次探测使用的方法（用于 manifest 记录，便于排查）。
+_panel_discovery_method: Optional[str] = None
+
+#: 动态扫描的目标根目录。
+_DYNAMIC_SCAN_ROOTS: Tuple[str, ...] = ("/www", "/opt", "/home", "/root", "/usr/local")
+
+#: 动态扫描中匹配的目录名（小写比对）。
+_DYNAMIC_SCAN_NAMES: Tuple[str, ...] = ("mdserver-web", "panel", "mdserver-web-main")
+
 
 def is_panel_root(path: pathlib.Path) -> bool:
     """通过 `web/core/mw.py` + `plugins/` 判定是否为 mdserver-web 安装根。"""
@@ -561,27 +570,89 @@ def is_panel_root(path: pathlib.Path) -> bool:
     return (path / "web" / "core" / "mw.py").is_file() and (path / "plugins").is_dir()
 
 
+def _dynamic_scan_panel() -> Optional[pathlib.Path]:
+    """第 2/3 级动态探测：cwd 向上回溯 + 顶级目录 glob 扫描。"""
+    global _panel_discovery_method
+    # --- 第 2 级：从当前工作目录向上回溯 -------------------------------- #
+    try:
+        cwd = pathlib.Path(os.getcwd()).resolve()
+    except (OSError, FileNotFoundError):
+        cwd = pathlib.Path("/")
+    p: pathlib.Path = cwd
+    while True:
+        if is_panel_root(p):
+            _panel_discovery_method = "cwd_parents"
+            return p
+        parent = p.parent
+        if parent == p:  # 已到达根目录 /
+            break
+        p = parent
+
+    # --- 第 3 级：顶级目录下 glob 扫描 --------------------------------- #
+    for search_root_str in _DYNAMIC_SCAN_ROOTS:
+        search_root = pathlib.Path(search_root_str)
+        if not search_root.is_dir():
+            continue
+        try:
+            for d1 in search_root.iterdir():
+                if not d1.is_dir():
+                    continue
+                # 第 1 层：search_root/<d1>/<target-name>
+                for d2 in d1.iterdir():
+                    if not d2.is_dir():
+                        continue
+                    if d2.name.lower() in _DYNAMIC_SCAN_NAMES and is_panel_root(d2):
+                        _panel_discovery_method = "glob_scan"
+                        return d2.resolve()
+        except PermissionError:
+            continue
+    return None
+
+
 def discover_panel_root(
     explicit: Optional[str] = None,
-    candidates: Sequence[str] = PANEL_ROOT_CANDIDATES,
+    candidates: Optional[Sequence[str]] = None,
+    dynamic_scan: bool = True,
 ) -> Optional[pathlib.Path]:
     """
-    定位面板根目录。
+    定位面板根目录（三级探测）。
 
-    显式指定时必须校验通过，否则直接报错；未指定时按候选列表探测，
+    1. 显式 --panel-root：校验后直接返回
+    2. 硬编码候选列表（PANEL_ROOT_CANDIDATES）
+    3. 从当前工作目录向上回溯到根 /
+    4. 在 /www /opt /home /root /usr/local 下 glob 扫描
+
     探测不到返回 None（调用方降级为仅备份系统目录）。
+    通过 _panel_discovery_method 记录本次探测手段。
     """
+    global _panel_discovery_method
+    _panel_discovery_method = None
+
+    if candidates is None:
+        candidates = PANEL_ROOT_CANDIDATES
+
     if explicit:
-        path = pathlib.Path(explicit).expanduser()
+        path = pathlib.Path(explicit).expanduser().resolve()
         if not path.is_dir():
             die(f"--panel-root 指向的目录不存在: {path}")
         if not is_panel_root(path):
             die(f"--panel-root 不像 mdserver-web 安装根（缺少 web/core/mw.py 或 plugins/）: {path}")
-        return path.resolve()
+        _panel_discovery_method = "explicit"
+        return path
+
+    # --- 第 1 级：硬编码候选列表 ----------------------------------------- #
     for candidate in candidates:
         path = pathlib.Path(candidate)
         if path.is_dir() and is_panel_root(path):
+            _panel_discovery_method = "candidates"
             return path.resolve()
+
+    # --- 第 2/3 级：动态扫描 --------------------------------------------- #
+    if dynamic_scan:
+        result = _dynamic_scan_panel()
+        if result is not None:
+            return result
+
     return None
 
 
@@ -1668,6 +1739,8 @@ class BackupPlan:
     site_root: Optional[pathlib.Path] = None
     #: 实际采集的计划任务脚本目录（serverDir/cron）。
     cron_dir: Optional[pathlib.Path] = None
+    #: 面板根目录探测手段（candidates / cwd_parents / glob_scan / explicit）。
+    panel_discovery_method: Optional[str] = None
 
 
 #: 面板 data 目录中的关键文件（用于 manifest 记录其是否存在）。
@@ -1692,10 +1765,22 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
 
     # --- 面板 ------------------------------------------------------------- #
     panel_root = discover_panel_root(args.panel_root)
+    plan.panel_discovery_method = _panel_discovery_method
     if panel_root is None:
         warn("未探测到 mdserver-web 面板安装目录，将仅备份系统目录。可用 --panel-root 显式指定。")
     else:
-        info(f"面板根目录: {panel_root}")
+        # 根据探测方式定制日志
+        _METHOD_LABELS = {
+            "explicit": "显式指定",
+            "candidates": "候选列表命中",
+            "cwd_parents": "从当前目录向上回溯",
+            "glob_scan": "自动扫描发现",
+        }
+        label = _METHOD_LABELS.get(_panel_discovery_method, "")
+        if label:
+            info(f"面板根目录（{label}）: {panel_root}")
+        else:
+            info(f"面板根目录: {panel_root}")
         layout = PanelLayout(panel_root)
         plan.panel_root = panel_root
         plan.layout = layout
@@ -1956,6 +2041,7 @@ def build_manifest(
         "host": host_metadata(),
         "hostname": socket.gethostname(),
         "panel_root": str(plan.panel_root) if plan.panel_root else None,
+        "panel_discovery_method": plan.panel_discovery_method,
         "panel_layout": plan.layout.as_dict() if plan.layout else None,
         "panel_data_key_files": {},
         "detected_plugins": [],
@@ -2114,6 +2200,19 @@ def backup_command(args: argparse.Namespace) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists() and not args.force:
         die(f"输出文件已存在: {output}（使用 --force 覆盖）")
+
+    # 终端交互环境下给用户确认机会（非交互/shell 重定向时跳过）
+    if sys.stdin.isatty():
+        print()
+        print(f"面板插件: {len(plan.plugins)} 个 | 数据库导出: {len(plan.db_targets)} 个 | 采集单元: {len(plan.units)} 个")
+        print(f"业务站点: {'是' if plan.include_wwwroot else '否'} | /home: {'是' if plan.include_home else '否'}")
+        print(f"输出归档: {output} | 压缩: xz {XZ_LEVEL} -T{plan.threads}")
+        try:
+            input("按回车键开始备份（Ctrl+C 取消）... ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            info("已取消。")
+            return
 
     work_parent = pathlib.Path(args.work_dir).expanduser() if args.work_dir else pathlib.Path("/var/tmp")
     work_parent.mkdir(parents=True, exist_ok=True)
