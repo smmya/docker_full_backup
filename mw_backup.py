@@ -1391,11 +1391,24 @@ def dump_mysql(plugin_dir: pathlib.Path, out_path: pathlib.Path, plugin: str, en
     使用 mysqldump / mariadb-dump 导出全部数据库。
 
     依次尝试：插件自带二进制 + 插件 my.cnf → 插件自带二进制（走 ~/.my.cnf）
-    → 系统 mariadb-dump / mysqldump。任一成功即返回。
+    → TCP (127.0.0.1:3306) 回退 → 读 panel plugin_dir/mysql.db 密码 → 系统 mariadb-dump / mysqldump。任一成功即返回。
     """
     result = DumpResult(plugin=plugin, engine=engine, relative=str(out_path.name), ok=False)
     my_cnf = plugin_dir / "etc" / "my.cnf"
     socket_path = parse_conf_value(_read_text_safe(my_cnf), "socket") if my_cnf.is_file() else None
+
+    mysql_db = plugin_dir / "mysql.db"
+    mysql_pwd: Optional[str] = None
+    if mysql_db.is_file():
+        try:
+            import sqlite3 as _sql
+            _db = _sql.connect(str(mysql_db))
+            _row = _db.execute("SELECT mysql_root FROM config WHERE id=1").fetchone()
+            if _row and _row[0]:
+                mysql_pwd = _row[0]
+            _db.close()
+        except Exception:
+            pass
 
     binaries: List[str] = []
     if engine == "mariadb":
@@ -1433,6 +1446,9 @@ def dump_mysql(plugin_dir: pathlib.Path, out_path: pathlib.Path, plugin: str, en
         if socket_path:
             base += [f"--socket={socket_path}"]
         attempts.append(base + common)
+        attempts.append([resolved, "-uroot", "-h", "127.0.0.1"] + common)
+        if mysql_pwd:
+            attempts.append([resolved, "-uroot", f"-p{mysql_pwd}"] + common)
 
     if not attempts:
         result.message = "未找到 mysqldump / mariadb-dump 可执行文件"
