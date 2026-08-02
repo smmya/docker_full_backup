@@ -1756,6 +1756,14 @@ PANEL_DATA_KEY_FILES: Tuple[str, ...] = (
 #: serverDir 根目录下的共享配置/元数据文件模式（如 mysql.db）。
 SERVER_ROOT_META_GLOBS: Tuple[str, ...] = ("*.db", "*.pl", "*.json", "*.conf")
 
+#: 面板探测手段的中文标签映射。
+_METHOD_LABELS: Dict[str, str] = {
+    "explicit": "显式指定",
+    "candidates": "候选列表命中",
+    "cwd_parents": "从当前目录向上回溯",
+    "glob_scan": "自动扫描发现",
+}
+
 
 def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
     """把命令行参数解析成一份完整的、可打印也可执行的备份计划。"""
@@ -1775,12 +1783,6 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
         warn("未探测到 mdserver-web 面板安装目录，将仅备份系统目录。可用 --panel-root 显式指定。")
     else:
         # 根据探测方式定制日志
-        _METHOD_LABELS = {
-            "explicit": "显式指定",
-            "candidates": "候选列表命中",
-            "cwd_parents": "从当前目录向上回溯",
-            "glob_scan": "自动扫描发现",
-        }
         label = _METHOD_LABELS.get(_panel_discovery_method, "")
         if label:
             info(f"面板根目录（{label}）: {panel_root}")
@@ -2209,9 +2211,42 @@ def backup_command(args: argparse.Namespace) -> None:
     # 终端交互环境下给用户确认机会（非交互/shell 重定向时跳过）
     if sys.stdin.isatty():
         print()
-        print(f"面板插件: {len(plan.plugins)} 个 | 数据库导出: {len(plan.db_targets)} 个 | 采集单元: {len(plan.units)} 个")
-        print(f"业务站点: {'是' if plan.include_wwwroot else '否'} | /home: {'是' if plan.include_home else '否'}")
-        print(f"输出归档: {output} | 压缩: xz {XZ_LEVEL} -T{plan.threads}")
+        print("=== 备份确认 ===")
+        print()
+        # 面板路径与探测方式
+        if plan.panel_root is not None:
+            method_label = _METHOD_LABELS.get(plan.panel_discovery_method or "", "")
+            suffix = f" ({method_label})" if method_label else ""
+            print(f"面板: {plan.panel_root}{suffix}")
+        else:
+            print("面板: (未探测到)")
+        # 已安装插件
+        if plan.plugins:
+            print(f"已安装插件 ({len(plan.plugins)} 个):")
+            for plugin_plan in plan.plugins:
+                marker = f" [DB:{plugin_plan.db_engine}]" if plugin_plan.db_engine else ""
+                print(f"  - {plugin_plan.name}{marker}")
+        else:
+            print("已安装插件: (无)")
+        print()
+        # 采集单元
+        if plan.units:
+            print(f"采集单元 ({len(plan.units)} 个):")
+            for unit in plan.units:
+                print(f"  {unit.archive_prefix:<30} {unit.note}")
+        else:
+            print("采集单元: (无)")
+        print()
+        # wwwroot / home / 输出 / 压缩
+        if plan.include_wwwroot:
+            wwwroot_label = str(plan.site_root) if plan.site_root else "(未能确定)"
+            print(f"/wwwroot: {wwwroot_label}")
+        else:
+            print("/wwwroot: 否")
+        print(f"/home: {'是' if plan.include_home else '否'}")
+        print(f"输出: {output}")
+        print(f"压缩: xz {XZ_LEVEL} -T{plan.threads}")
+        print()
         try:
             input("按回车键开始备份（Ctrl+C 取消）... ")
         except (EOFError, KeyboardInterrupt):
