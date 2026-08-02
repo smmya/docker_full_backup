@@ -1386,14 +1386,43 @@ def _run_side_effect_dump(
     return True, ""
 
 
-def dump_mysql(plugin_dir: pathlib.Path, out_path: pathlib.Path, plugin: str, engine: str) -> DumpResult:
-    """
-    使用 mysqldump / mariadb-dump 导出全部数据库。
+def _derive_mysql_client(mysqldump_path: str) -> str:
+    """从 mysqldump/mariadb-dump 路径推导 mysql/mariadb CLI 路径。"""
+    dirname = os.path.dirname(mysqldump_path)
+    if "mariadb-dump" in mysqldump_path:
+        candidates = [
+            os.path.join(dirname, "mariadb"),
+            os.path.join(dirname, "mysql"),
+            "mariadb",
+            "mysql",
+        ]
+    else:
+        candidates = [
+            os.path.join(dirname, "mysql"),
+            os.path.join(dirname, "mariadb"),
+            "mysql",
+            "mariadb",
+        ]
+    resolved = which_first(candidates)
+    return resolved if resolved else "mysql"
 
-    依次尝试：插件自带二进制 + 插件 my.cnf → 插件自带二进制（走 ~/.my.cnf）
-    → TCP (127.0.0.1:3306) 回退 → 读 panel plugin_dir/mysql.db 密码 → 系统 mariadb-dump / mysqldump。任一成功即返回。
+
+def dump_mysql(plugin_dir: pathlib.Path, dest_dir: pathlib.Path, plugin: str, engine: str) -> List[DumpResult]:
     """
-    result = DumpResult(plugin=plugin, engine=engine, relative=str(out_path.name), ok=False)
+    使用 mysqldump / mariadb-dump 按库拆分导出。
+
+    流程：
+      1. 确定可用二进制与连接参数（同旧逻辑）
+      2. 用已验证的连接执行 SHOW DATABASES，获取用户数据库列表
+      3. 对每个用户库单独导出到 ``<dest_dir>/mysql-<db>.sql``
+      4. 若 SHOW DATABASES 失败，回退为 ``--all-databases`` 行为（兼容性）
+      5. 返回 ``List[DumpResult]``，每个库一个
+
+    边界处理：
+      - 无用户数据库 → 返回空列表
+      - 单个库导出失败 → 记入对应 DumpResult.message，继续下一个库
+    """
+    SYSTEM_DBS: FrozenSet[str] = frozenset({"information_schema", "performance_schema", "mysql", "sys"})
     my_cnf = plugin_dir / "etc" / "my.cnf"
     socket_path = parse_conf_value(_read_text_safe(my_cnf), "socket") if my_cnf.is_file() else None
 
@@ -1426,45 +1455,118 @@ def dump_mysql(plugin_dir: pathlib.Path, out_path: pathlib.Path, plugin: str, en
             "mariadb-dump",
         ]
 
-    common = [
-        "--all-databases",
+    # 构建不带导出标志的连接尝试列表（先只测连通性 + 获取库列表）
+    all_attempts: List[List[str]] = []
+    for binary in binaries:
+        resolved = which_first([binary])
+        if not resolved:
+            continue
+        if my_cnf.is_file():
+            all_attempts.append([resolved, f"--defaults-file={my_cnf}", "-uroot"])
+        base = [resolved, "-uroot"]
+        if socket_path:
+            base += [f"--socket={socket_path}"]
+        all_attempts.append(list(base))
+        all_attempts.append([resolved, "-uroot", "-h", "127.0.0.1"])
+        if mysql_pwd:
+            all_attempts.append([resolved, "-uroot", f"-p{mysql_pwd}"])
+
+    if not all_attempts:
+        result = DumpResult(
+            plugin=plugin, engine=engine, relative="dumps/mysql",
+            ok=False, message="未找到 mysqldump / mariadb-dump 可执行文件",
+        )
+        return [result]
+
+    # ── 步骤 1：尝试获取数据库列表 ───────────────────────────────────── #
+    dbs: List[str] = []
+    working_base: Optional[List[str]] = None
+    errors: List[str] = []
+
+    for base_cmd in all_attempts:
+        mysql_cli = _derive_mysql_client(base_cmd[0])
+        db_cmd = [mysql_cli] + base_cmd[1:] + ["-ss", "-e", "SHOW DATABASES"]
+        try:
+            proc = subprocess.run(
+                db_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            continue
+        if proc.returncode != 0 or not proc.stdout.strip():
+            errors.append(f"{shlex.join(db_cmd)} -> 退出码 {proc.returncode}")
+            continue
+        # 成功：解析数据库名，过滤系统库
+        raw_names = [line.strip() for line in proc.stdout.strip().splitlines() if line.strip()]
+        dbs = [name for name in raw_names if name.lower() not in SYSTEM_DBS]
+        working_base = base_cmd
+        break
+
+    # ── 步骤 2：回退为 --all-databases（兼容性） ─────────────────────── #
+    if working_base is None:
+        common = [
+            "--all-databases",
+            "--single-transaction",
+            "--routines",
+            "--events",
+            "--triggers",
+            "--default-character-set=utf8mb4",
+        ]
+        out_path = dest_dir / "mysql-all.sql"
+        attempt_errors: List[str] = []
+        for base_cmd in all_attempts:
+            cmd = base_cmd + common
+            ok, message = _run_dump_to_file(cmd, out_path)
+            if ok:
+                result = DumpResult(
+                    plugin=plugin, engine=engine,
+                    relative="dumps/mysql-all.sql", ok=True,
+                    command=shlex.join(cmd), bytes=out_path.stat().st_size,
+                )
+                return [result]
+            attempt_errors.append(f"{shlex.join(cmd)} -> {message}")
+        result = DumpResult(
+            plugin=plugin, engine=engine,
+            relative="dumps/mysql-all.sql", ok=False,
+            message="; ".join(attempt_errors[-3:] or errors[-3:]),
+        )
+        return [result]
+
+    # ── 步骤 3：无用户数据库，直接返回空列表 ─────────────────────────── #
+    if not dbs:
+        return []
+
+    # ── 步骤 4：按库导出 ─────────────────────────────────────────────── #
+    common_flags = [
         "--single-transaction",
         "--routines",
         "--events",
         "--triggers",
         "--default-character-set=utf8mb4",
     ]
-
-    attempts: List[List[str]] = []
-    for binary in binaries:
-        resolved = which_first([binary])
-        if not resolved:
-            continue
-        if my_cnf.is_file():
-            attempts.append([resolved, f"--defaults-file={my_cnf}", "-uroot"] + common)
-        base = [resolved, "-uroot"]
-        if socket_path:
-            base += [f"--socket={socket_path}"]
-        attempts.append(base + common)
-        attempts.append([resolved, "-uroot", "-h", "127.0.0.1"] + common)
-        if mysql_pwd:
-            attempts.append([resolved, "-uroot", f"-p{mysql_pwd}"] + common)
-
-    if not attempts:
-        result.message = "未找到 mysqldump / mariadb-dump 可执行文件"
-        return result
-
-    errors: List[str] = []
-    for cmd in attempts:
+    results: List[DumpResult] = []
+    for db in dbs:
+        out_path = dest_dir / f"mysql-{db}.sql"
+        relative = f"dumps/mysql-{db}.sql"
+        result = DumpResult(plugin=plugin, engine=engine, relative=relative, ok=False)
+        cmd = working_base + ["--databases", db] + common_flags
         ok, message = _run_dump_to_file(cmd, out_path)
         if ok:
             result.ok = True
             result.command = shlex.join(cmd)
             result.bytes = out_path.stat().st_size
-            return result
-        errors.append(f"{shlex.join(cmd)} -> {message}")
-    result.message = "; ".join(errors[-3:])
-    return result
+        else:
+            result.message = message
+        results.append(result)
+    return results
 
 
 def dump_postgresql(plugin_dir: pathlib.Path, out_path: pathlib.Path, plugin: str) -> DumpResult:
@@ -1580,11 +1682,20 @@ def run_db_dumps(
             # 例如 mysql 与 mysql-community 同时"存在"，只导一次，避免互相覆盖。
             info(f"跳过重复的数据库导出目标: {plan.name} -> {spec.dump_relative}")
             continue
-        out_path = stage_root / spec.dump_relative
         info(f"导出数据库: {plan.name} -> {spec.dump_relative}")
         if spec.engine in ("mysql", "mariadb"):
-            result = dump_mysql(plan.base_dir, out_path, plan.name, spec.engine)
-        elif spec.engine == "postgresql":
+            dest_dir = stage_root / "dumps"
+            batch = dump_mysql(plan.base_dir, dest_dir, plan.name, spec.engine)
+            for result in batch:
+                if result.ok:
+                    info(f"  完成: {result.relative} ({human_bytes(result.bytes)})")
+                else:
+                    warn(f"数据库导出失败（已记入 manifest，继续备份）: {plan.name}: {result.message}")
+                results.append(result)
+            handled_relatives.add(spec.dump_relative)
+            continue
+        out_path = stage_root / spec.dump_relative
+        if spec.engine == "postgresql":
             result = dump_postgresql(plan.base_dir, out_path, plan.name)
         elif spec.engine == "redis":
             result = dump_redis(plan.base_dir, out_path, plan.name)
@@ -2106,11 +2217,13 @@ def build_manifest(
         for name in PANEL_DATA_KEY_FILES:
             manifest["panel_data_key_files"][name] = (plan.layout.data_dir / name).is_file()
 
-    dumps_by_plugin: Dict[str, DumpResult] = {d.plugin: d for d in dumps}
+    dumps_by_plugin: Dict[str, List[DumpResult]] = {}
+    for d in dumps:
+        dumps_by_plugin.setdefault(d.plugin, []).append(d)
     for plugin_plan in plan.plugins:
-        dump = dumps_by_plugin.get(plugin_plan.name)
+        plugin_dumps = dumps_by_plugin.get(plugin_plan.name, [])
         record = plugin_plan.as_dict()
-        record["db_dumped"] = bool(dump and dump.ok)
+        record["db_dumped"] = any(d.ok for d in plugin_dumps)
         manifest["detected_plugins"].append(record)
 
     for dump in dumps:
