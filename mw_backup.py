@@ -3,8 +3,10 @@
 mdserver-web (MW 面板) 关键数据备份工具。
 
 面向 Linux，基线兼容 Python 3.8+，仅依赖标准库；外部只需要 `tar` 与 `xz`。
-本工具**只做备份，不做还原**：产出单一 `.tar.xz` 归档，内含 `manifest.json`
+  本工具**只做备份，不做还原**：产出单一 `.tar.xz` 归档，内含 `manifest.json`
 与 `checksums.sha256`，用于事后核对完整性与人工按需取用。
+
+默认使用 xz -6 压缩（速度与体积平衡），`--max-compress` 切换为 xz -9e 极限压缩。
 
 备份内容：
   * 自动探测面板已安装插件（`<fatherDir>/server/<plugin>`），采集其配置与数据
@@ -51,8 +53,9 @@ from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional, Seq
 
 VERSION = "1.0.0"
 
-#: 最高压缩率档位；-9e 会显著增加 CPU 与内存开销，但归档最小。
-XZ_LEVEL = "-9e"
+#: 默认压缩档位；-6 在速度与体积之间取平衡，适合日常备份。
+#: 使用 --max-compress 可切回 -9e 极限压缩。
+XZ_LEVEL = "-6"
 #: xz -9 每个线程大约需要的内存（MiB），用于按内存反推安全线程数。
 XZ_MEM_PER_THREAD_MIB = 700
 #: 单文件体积上限，超过则跳过并记入 manifest（避免误打包巨型二进制/镜像）。
@@ -1882,6 +1885,8 @@ class BackupPlan:
     cron_dir: Optional[pathlib.Path] = None
     #: 面板根目录探测手段（candidates / cwd_parents / glob_scan / explicit）。
     panel_discovery_method: Optional[str] = None
+    #: 是否使用 xz -9e 极限压缩（--max-compress）。
+    max_compress: bool = False
 
 
 #: 面板 data 目录中的关键文件（用于 manifest 记录其是否存在）。
@@ -1905,6 +1910,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
     """把命令行参数解析成一份完整的、可打印也可执行的备份计划。"""
     plan = BackupPlan()
     plan.threads = compute_threads(args.threads)
+    plan.max_compress = getattr(args, "max_compress", False)
     plan.max_file_bytes = int(args.max_file_size) * 1024 * 1024 if args.max_file_size else 0
     plan.include_home = not args.no_home
     # --wwwroot 支持三态：未给出 -> None（关闭）；给出但无值 -> ""（自动解析）；
@@ -2197,7 +2203,7 @@ def build_manifest(
         "cron_dir": str(plan.cron_dir) if plan.cron_dir else None,
         "compression": {
             "algorithm": "xz",
-            "level": XZ_LEVEL,
+            "level": "-9e" if plan.max_compress else XZ_LEVEL,
             "threads": threads,
             "tar_flags": tar_flags_for_create(),
         },
@@ -2275,7 +2281,7 @@ def print_plan(plan: BackupPlan) -> None:
         print(f"业务站点根目录  : {plan.site_root or '(未能确定，见上方告警)'}")
     else:
         print("业务站点根目录  : (已关闭；去掉 --no-wwwroot 可重新采集)")
-    print(f"压缩            : xz {XZ_LEVEL} -T{plan.threads}")
+    print(f"压缩            : xz {'-9e' if plan.max_compress else XZ_LEVEL} -T{plan.threads}")
     print(f"单文件上限      : {human_bytes(plan.max_file_bytes) if plan.max_file_bytes else '不限制'}")
     print(f"包含 /home      : {'是' if plan.include_home else '否'}")
     print()
@@ -2335,6 +2341,14 @@ def backup_command(args: argparse.Namespace) -> None:
     require_commands("tar", "xz")
 
     plan = build_backup_plan(args)
+
+    xz_level = XZ_LEVEL
+    if plan.max_compress:
+        xz_level = "-9e"
+        info(f"压缩参数: xz {xz_level} -T{plan.threads}（极限压缩，较慢）")
+    else:
+        info(f"压缩参数: xz {xz_level} -T{plan.threads}")
+
     stamp = now_stamp()
     hostname = socket.gethostname()
     default_name = f"mw-backup-{safe_slug(hostname)}-{stamp}.tar.xz"
@@ -2383,7 +2397,7 @@ def backup_command(args: argparse.Namespace) -> None:
             print("/wwwroot: 否")
         print(f"/home: {'是' if plan.include_home else '否'}")
         print(f"输出: {output}")
-        print(f"压缩: xz {XZ_LEVEL} -T{plan.threads}")
+        print(f"压缩: xz {xz_level} -T{plan.threads}")
         print()
         try:
             input("按回车键开始备份（Ctrl+C 取消）... ")
@@ -2399,7 +2413,6 @@ def backup_command(args: argparse.Namespace) -> None:
     # 某软链接路径时，self_paths 排除才能精确命中（iter_capture 用 normpath 精确匹配）。
     work = work.resolve()
     info(f"暂存目录: {work}")
-    info(f"压缩参数: xz {XZ_LEVEL} -T{plan.threads}")
 
     try:
         # 1) 数据库导出（优先于文件采集，保证 dump 与配置尽量同一时刻）
@@ -2432,7 +2445,7 @@ def backup_command(args: argparse.Namespace) -> None:
         xz_compress_pipeline(
             ["tar", *tar_flags_for_create(), "-C", str(work), "-cpf", "-", "."],
             output,
-            XZ_LEVEL,
+            xz_level,
             plan.threads,
         )
         test_archive_integrity(output)
@@ -2498,6 +2511,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
         help="追加 /etc 白名单路径，可重复指定",
     )
     parser.add_argument("--threads", type=int, default=None, help="xz 压缩线程数；默认按 CPU 与内存自动计算")
+    parser.add_argument("--max-compress", action="store_true", help="使用 xz -9e 极限压缩（更小但更慢，适合长期归档）")
     parser.add_argument(
         "--max-file-size",
         type=int,
@@ -2534,6 +2548,9 @@ def build_parser() -> argparse.ArgumentParser:
   # 追加 /etc 白名单路径并限制压缩线程
   sudo python3 mw_backup.py backup --etc-allowlist-extra /etc/myapp --threads 4
 
+  # 使用极限压缩（xz -9e，更小但更慢，适合长期归档）
+  sudo python3 mw_backup.py backup --max-compress
+
   # 业务站点数据默认备份；关闭则用 --no-wwwroot
   sudo python3 mw_backup.py backup --no-wwwroot
 
@@ -2547,6 +2564,7 @@ def build_parser() -> argparse.ArgumentParser:
   * 面板计划任务脚本（serverDir/cron）默认备份，其执行日志 *.log 不备份
   * 业务站点数据默认备份，不需要时用 --no-wwwroot 关闭
   * /home 默认备份，不需要时用 --no-home 关闭
+  * 默认使用 xz -6 压缩（速度与体积平衡），--max-compress 切换为 xz -9e 极限压缩
 """,
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
