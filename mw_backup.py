@@ -565,9 +565,14 @@ _DYNAMIC_SCAN_NAMES: Tuple[str, ...] = ("mdserver-web", "panel", "mdserver-web-m
 
 
 def is_panel_root(path: pathlib.Path) -> bool:
-    """通过 `web/core/mw.py` + `plugins/` 判定是否为 mdserver-web 安装根。"""
+    """判定是否为 mdserver-web 安装根。
+
+    安装后的面板是 flat 结构（无 web/ 子目录），用以下标志判定：
+    - app.py（Flask 入口）
+    - data/（运行时数据目录）
+    - plugins/（插件源码目录）"""
     path = pathlib.Path(path)
-    return (path / "web" / "core" / "mw.py").is_file() and (path / "plugins").is_dir()
+    return (path / "app.py").is_file() and (path / "data").is_dir() and (path / "plugins").is_dir()
 
 
 def _dynamic_scan_panel() -> Optional[pathlib.Path]:
