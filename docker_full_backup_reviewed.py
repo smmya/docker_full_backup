@@ -40,11 +40,13 @@ import time
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_DOCKER_SOCKET = "/var/run/docker.sock"
 DEFAULT_FINAL_XZ_LEVEL = "-6"
 MAX_DATA_XZ_LEVEL = "-9e"
-DEFAULT_XZ_THREADS = "1"
+DEFAULT_XZ_THREADS = "auto"
+XZ_AUTO_RESERVE_MIB = 512
+XZ_AUTO_MIN_LIMIT_MIB = 256
 
 
 class BackupError(RuntimeError):
@@ -211,19 +213,106 @@ def resolve_containers(identifiers: Sequence[str], all_flag: bool, interactive: 
     return result
 
 
+_XZ_AUTO_PROFILE: Optional[Tuple[int, int, int]] = None
+_XZ_AUTO_PROFILE_LOGGED = False
+
+
+def available_cpu_count() -> int:
+    """Return CPUs available to this process, respecting CPU affinity when possible."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def linux_mem_available_mib() -> int:
+    """Read MemAvailable from /proc/meminfo, falling back to MemFree."""
+    values: Dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as fh:
+            for line in fh:
+                key, sep, rest = line.partition(":")
+                if not sep:
+                    continue
+                fields = rest.strip().split()
+                if fields and fields[0].isdigit():
+                    values[key] = int(fields[0])  # Linux reports these values in KiB.
+    except OSError:
+        return 0
+    kib = values.get("MemAvailable") or values.get("MemFree") or 0
+    return max(0, kib // 1024)
+
+
+def xz_auto_profile() -> Tuple[int, int, int]:
+    """Return (CPU count, available MiB, safe xz compression limit MiB)."""
+    global _XZ_AUTO_PROFILE
+    if _XZ_AUTO_PROFILE is not None:
+        return _XZ_AUTO_PROFILE
+
+    cpus = available_cpu_count()
+    available_mib = linux_mem_available_mib()
+    if available_mib <= 0:
+        # Let xz use its own system-specific soft limit if MemAvailable cannot be read.
+        limit_mib = 0
+    else:
+        # Keep at least 512 MiB free where possible, and never hand xz more than
+        # 75% of currently available RAM. xz may reduce its worker count further
+        # for memory-heavy presets such as -9e.
+        by_percentage = max(XZ_AUTO_MIN_LIMIT_MIB, available_mib * 3 // 4)
+        by_reserve = max(XZ_AUTO_MIN_LIMIT_MIB, available_mib - XZ_AUTO_RESERVE_MIB)
+        limit_mib = min(by_percentage, by_reserve)
+        limit_mib = min(limit_mib, available_mib)
+
+    _XZ_AUTO_PROFILE = (cpus, available_mib, limit_mib)
+    return _XZ_AUTO_PROFILE
+
+
+def build_xz_command(level: str, threads: str) -> List[str]:
+    global _XZ_AUTO_PROFILE_LOGGED
+    value = str(threads).strip().lower()
+    if value in ("auto", "0"):
+        cpus, available_mib, limit_mib = xz_auto_profile()
+        if not _XZ_AUTO_PROFILE_LOGGED:
+            if limit_mib:
+                info(
+                    f"XZ auto tuning: CPUs={cpus}, MemAvailable={available_mib} MiB, "
+                    f"compression memory limit={limit_mib} MiB"
+                )
+            else:
+                info(f"XZ auto tuning: CPUs={cpus}, memory limit delegated to xz")
+            _XZ_AUTO_PROFILE_LOGGED = True
+        cmd = ["xz", level, "-T0"]
+        if limit_mib:
+            cmd.append(f"--memlimit-compress={limit_mib}MiB")
+        cmd.append("-c")
+        return cmd
+
+    try:
+        count = int(value)
+    except ValueError:
+        die("--xz-threads must be 'auto', 0, or a positive integer.")
+    if count < 1:
+        die("--xz-threads must be 'auto', 0, or a positive integer.")
+    return ["xz", level, f"-T{count}", "-c"]
+
+
 def xz_compress_pipeline(producer_cmd: Sequence[str], output_path: pathlib.Path, level: str, threads: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     info(f"Writing {output_path}")
+    xz_cmd = build_xz_command(level, threads)
     with output_path.open("wb") as out:
         producer = subprocess.Popen(list(producer_cmd), stdout=subprocess.PIPE)
         assert producer.stdout is not None
-        compressor = subprocess.Popen(["xz", level, f"-T{threads}", "-c"], stdin=producer.stdout, stdout=out)
+        compressor = subprocess.Popen(xz_cmd, stdin=producer.stdout, stdout=out)
         producer.stdout.close()
         rc_comp = compressor.wait()
         rc_prod = producer.wait()
     if rc_prod != 0 or rc_comp != 0:
         output_path.unlink(missing_ok=True)
-        die(f"Compression pipeline failed: {shlex.join(list(producer_cmd))} | xz {level}")
+        die(
+            f"Compression pipeline failed: {shlex.join(list(producer_cmd))} | "
+            f"{shlex.join(xz_cmd)}"
+        )
 
 
 def tar_flags_for_create() -> List[str]:
@@ -1670,8 +1759,14 @@ Default behavior:
     p_backup.add_argument("-o", "--output", help="final .tar.xz output path")
     p_backup.add_argument("--consistency", choices=("stop", "pause", "live"), default="stop",
                           help="stop: graceful stop (default); pause: freeze; live: no global quiesce")
-    p_backup.add_argument("--xz-threads", default=DEFAULT_XZ_THREADS,
-                          help="xz threads; default 1 maximizes ratio and limits RAM")
+    p_backup.add_argument(
+        "--xz-threads",
+        default=DEFAULT_XZ_THREADS,
+        help=(
+            "xz worker threads: auto (default) uses all available CPUs with a "
+            "dynamic RAM limit; 0 is an alias for auto; or specify a positive integer"
+        ),
+    )
     p_backup.add_argument("--no-logs", action="store_true", help="do not archive historical Docker log files")
     p_backup.add_argument("--non-interactive", action="store_true", help="disable selection prompts")
     p_backup.add_argument("--work-dir", help="temporary working parent directory (default /var/tmp)")
