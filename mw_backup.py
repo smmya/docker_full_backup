@@ -18,6 +18,7 @@ mdserver-web (MW 面板) 关键数据备份工具。
     `/home`（默认备份，`--no-home` 关闭）
   * 业务站点数据：默认开启，站点根目录按面板 `site_path` 选项
     动态解析（默认 `<fatherDir>/wwwroot`），也可 `--wwwroot <绝对路径>` 直接指定；`--no-wwwroot` 关闭
+    站点采集仅排除 node_modules/.git/*.log/__pycache__，其余全部保留
 
 归档内部目录结构：
   * mw-server/panel/       — 面板自身状态（data/、ssl/）
@@ -29,10 +30,10 @@ mdserver-web (MW 面板) 关键数据备份工具。
   * wwwroot/               — 业务站点数据
 
 明确不备份：
-  * 二进制包与中间文件（缓存、构建产物、node_modules、*.pyc、.git、版本 tar 包…）
+  * 编译中间产物与运行期文件（__pycache__、*.pyc、*.o、*.log、*.pid、*.core、node_modules、.git 等）
   * 数据库的原始数据目录（已由导出命令覆盖）
-  * 网站根目录 `wwwroot` 默认采集（使用 `--no-wwwroot` 关闭）；体量较大时建议按需关闭
-"""
+  * 网站根目录 `wwwroot` 默认采集（使用 `--no-wwwroot` 关闭）；体量较大时建议按需关闭。
+    站点采集使用宽松策略：仅排除 node_modules/.git/*.log/__pycache__。"""
 
 import argparse
 import dataclasses
@@ -64,6 +65,7 @@ DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024
 #: 捕获强度。strict 用于用户目录/插件目录，config 用于 /etc 与面板配置。
 PROFILE_STRICT = "strict"
 PROFILE_CONFIG = "config"
+PROFILE_SITE = "site"
 
 # 确保 stdout/stderr 在非 UTF-8 locale（如 C/POSIX）下不因中文提示语抛
 # UnicodeEncodeError；改用 backslashreplace 兜底（Python 3.7+ 的 reconfigure 特性）。
@@ -261,14 +263,11 @@ BINARY_DIR_NAMES: FrozenSet[str] = frozenset({
     ".eggs", "tmp", "temp", "logs", "log", "run", "cache", "caches",
 })
 
-#: strict profile 下按文件名匹配排除的模式（二进制、压缩包、日志、运行期文件）。
+#: strict profile 下按文件名匹配排除的模式（字节码、编译中间产物、日志、运行期文件）。
+#: 注意：不排除 .so / .dll / .exe / .tar.* / .zip / .deb / .img 等——这些在服务器上
+#: 可能是合法数据。超大文件仍受 --max-file-size（默认 256 MiB）保护。
 BINARY_FILE_GLOBS: Tuple[str, ...] = (
-    "*.pyc", "*.pyo", "*.pyd", "*.so", "*.so.*", "*.a", "*.o", "*.obj", "*.ko",
-    "*.dll", "*.dylib", "*.exe", "*.class", "*.jar", "*.war", "*.whl", "*.egg",
-    "*.deb", "*.rpm", "*.apk", "*.msi", "*.appimage",
-    "*.img", "*.iso", "*.qcow2", "*.vmdk", "*.vdi", "*.swap",
-    "*.tar", "*.tar.*", "*.tgz", "*.tbz2", "*.txz", "*.zip", "*.7z", "*.rar",
-    "*.gz", "*.bz2", "*.xz", "*.zst", "*.lz4",
+    "*.pyc", "*.pyo", "*.pyd", "*.o", "*.obj", "*.ko",
     "*.log", "*.log.*", "*.out", "*.err",
     "*.pid", "*.sock", "*.core", "core.[0-9]*", "*.dmp", "*.stackdump",
     "*.swp", "*.swo", "*~",
@@ -292,6 +291,8 @@ def is_excluded_dir(name: str, profile: str = PROFILE_STRICT) -> bool:
         return True
     if profile == PROFILE_STRICT and name in BINARY_DIR_NAMES:
         return True
+    if profile == PROFILE_SITE:
+        return name in frozenset({"node_modules", ".git", "__pycache__"})
     return False
 
 
@@ -301,6 +302,8 @@ def is_excluded_file(name: str, profile: str = PROFILE_STRICT) -> bool:
         return True
     if profile == PROFILE_STRICT and _matches_any(name, BINARY_FILE_GLOBS):
         return True
+    if profile == PROFILE_SITE:
+        return _matches_any(name, ("*.log", "*.log.*"))
     return False
 
 
@@ -2055,10 +2058,10 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
                 archive_prefix="wwwroot",
                 source_path=str(site_root),
                 sources=[(site_root, "")],
-                # 与插件 data 采集一致：保留普通文件，剔除缓存/构建产物/
-                # node_modules/.git 等二进制与中间物。
-                profile=PROFILE_STRICT,
-                note=f"业务站点数据 {site_root}（已排除缓存/构建产物/node_modules/.git）",
+                # 站点采集使用 SITE profile：仅排除 node_modules/.git/*.log/__pycache__，
+                # 其余（包括构建产物、vendor、.venv 等）全部保留，确保站点完整可恢复。
+                profile=PROFILE_SITE,
+                note=f"业务站点数据 {site_root}（仅排除 node_modules/.git/*.log/__pycache__）",
             ))
 
     # --- 系统目录 --------------------------------------------------------- #
@@ -2074,7 +2077,7 @@ def build_backup_plan(args: argparse.Namespace) -> BackupPlan:
             archive_prefix=f"file/{name}",
             sources=[(path, "")],
             profile=PROFILE_STRICT,
-            note=f"系统目录 {path}（已排除二进制与中间文件）",
+            note=f"系统目录 {path}（已排除编译中间产物与运行期文件）",
         ))
 
     if plan.include_home:
@@ -2216,12 +2219,12 @@ def build_manifest(
             "bytes_uncompressed": total_bytes,
         },
         "excluded_by_design": [
-            "二进制文件与安装包（bin/lib/include/share、*.so、*.tar.*、*.deb 等）",
-            "构建与缓存中间产物（node_modules、__pycache__、.git、build、dist、logs、cache 等）",
+            "编译中间产物与运行期文件（__pycache__、*.pyc、*.o、*.log、*.pid、*.core、node_modules、.git、logs、cache 等）",
+            "构建目录（build、dist、target、obj、vendor、venv、site-packages 等）",
             "数据库原始数据目录（改用 mysqldump / pg_dumpall / redis-cli --rdb 导出）",
             "计划任务执行日志（serverDir/cron/*.log，脚本本身已备份）",
             (
-                "业务站点数据 wwwroot（本次已采集）"
+                "业务站点数据 wwwroot（本次已采集，仅排除 node_modules/.git/*.log/__pycache__）"
                 if plan.site_root
                 else "业务站点数据 wwwroot（本次未采集；使用 --no-wwwroot 关闭，或站点目录无法定位）"
             ),
@@ -2559,7 +2562,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 说明:
   * 数据库一律使用命令导出（mysqldump / pg_dumpall / redis-cli --rdb），不拷原始数据目录
-  * 二进制包与中间文件（缓存、构建产物、node_modules、*.pyc、.git、版本 tar 包等）不打包
+  * 编译中间产物与运行期文件（*.pyc、*.o、*.log、*.pid、*.core、node_modules、.git、构建目录等）不打包
   * /etc 采用白名单策略，只备份网络、用户/账户与用户自建服务配置
   * 面板计划任务脚本（serverDir/cron）默认备份，其执行日志 *.log 不备份
   * 业务站点数据默认备份，不需要时用 --no-wwwroot 关闭
